@@ -1,5 +1,7 @@
 # primecount — Gourdon's algorithm for π(x)
 
+[![selftest](https://github.com/nicoa2701/primegourdon/actions/workflows/selftest.yml/badge.svg)](https://github.com/nicoa2701/primegourdon/actions/workflows/selftest.yml)
+
 *[Version française : LISEZMOI.md](LISEZMOI.md)*
 
 A from-scratch C++20 implementation of **Xavier Gourdon's algorithm** for the

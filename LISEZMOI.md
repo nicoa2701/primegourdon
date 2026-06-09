@@ -1,5 +1,7 @@
 # primecount — l'algorithme de Gourdon pour π(x)
 
+[![selftest](https://github.com/nicoa2701/primegourdon/actions/workflows/selftest.yml/badge.svg)](https://github.com/nicoa2701/primegourdon/actions/workflows/selftest.yml)
+
 *[English version: README.md](README.md)*
 
 Une implémentation C++20 *from scratch* de l'**algorithme de Xavier Gourdon**
