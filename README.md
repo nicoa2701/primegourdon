@@ -100,7 +100,7 @@ Example:
 
 ```sh
 $ ./primecount 1e18
-24739954287740860  [43.930 s]
+24739954287740860  [42.195 s]
 
 $ ./primecount 1e18 -v
 RAM       available 4.79 GiB, estimated peak ~133.51 MiB (mode perf), max x ~1.4e+21
@@ -117,9 +117,8 @@ pi(x)  = 24739954287740860  [39.373 s, +1.487 s build]
 ## Benchmark
 
 Single-threaded fast path below 10¹¹; Gourdon's algorithm (all cores) above.
-Wall-clock and **peak resident memory** (`/usr/bin/time -v`, Maximum RSS); times
-are the best of repeated cold runs (this 45 W laptop throttles on multi-minute
-runs, so 10¹⁹ varies ±~15 %).
+Wall-clock and **peak resident memory** (`/usr/bin/time -v`, Maximum RSS). Each x
+is measured from a cold start (runs spaced several minutes apart).
 
 **Machine:** Intel Core i5-9300HF (Coffee Lake, 4C / 8T, AVX2), 8 threads,
 DIV32 auto-enabled.
@@ -141,10 +140,10 @@ DIV32 auto-enabled.
 | 10¹³  | 346 065 536 839       | 47 ms     | 9.3 MiB    |
 | 10¹⁴  | 3 204 941 750 802     | 120 ms    | 10.7 MiB   |
 | 10¹⁵  | 29 844 570 422 669    | 0.51 s    | 14.5 MiB   |
-| 10¹⁶  | 279 238 341 033 925   | 2.13 s    | 24.8 MiB   |
-| 10¹⁷  | 2 623 557 157 654 233 | 10.20 s   | 52.5 MiB   |
-| 10¹⁸  | 24 739 954 287 740 860 | 43.93 s  | 125.0 MiB  |
-| 10¹⁹  | 234 057 667 276 344 607 | 220.7 s | 321.6 MiB  |
+| 10¹⁶  | 279 238 341 033 925   | 2.16 s    | 24.8 MiB   |
+| 10¹⁷  | 2 623 557 157 654 233 | 9.83 s    | 52.5 MiB   |
+| 10¹⁸  | 24 739 954 287 740 860 | 42.20 s  | 125.0 MiB  |
+| 10¹⁹  | 234 057 667 276 344 607 | 210.9 s | 321.6 MiB  |
 
 (Default `--perf` path.) The **`--ram`** path trades ~1.15–1.2× time for an
 O(x^(1/3)) peak; measured peak RSS 25.8 / 48.6 / 108.8 / 270.1 MiB at
