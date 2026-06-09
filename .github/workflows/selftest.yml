@@ -1,0 +1,48 @@
+name: selftest
+
+# Build the project and run the exact self-test suite on every push and PR.
+# This is a CORRECTNESS gate, not a benchmark: GitHub runners are slow and
+# variable, so we never time anything here — we only check that the code
+# compiles cleanly and that every term + the full assembly stay bit-exact
+# against the brute-force / segmented-sieve oracle (see tests/selftest.cpp).
+#
+# `./run.sh --selftest` configures (Release), builds, and execs ./build/selftest,
+# which exits non-zero if any check fails — turning the job red.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}   # allow a manual run from the Actions tab
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false      # if GCC fails, still report Clang (and vice-versa)
+      matrix:
+        compiler: [gcc, clang]
+    name: selftest (${{ matrix.compiler }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          # cmake + OpenMP. libomp-dev provides OpenMP for Clang; GCC ships its
+          # own libgomp, but installing it is harmless and keeps both paths green.
+          sudo apt-get install -y cmake g++ clang libomp-dev
+
+      - name: Select compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang"   >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          else
+            echo "CC=gcc" >> "$GITHUB_ENV"
+            echo "CXX=g++" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and run self-tests
+        run: ./run.sh --selftest
