@@ -104,24 +104,26 @@ Exemple :
 
 ```sh
 $ ./primecount 1e18
-24739954287740860  [46.410 s]
+24739954287740860  [43.930 s]
 
 $ ./primecount 1e18 -v
-RAM       available 4.94 GiB, estimated peak ~133.51 MiB, max x ~1.4e+21
+RAM       available 4.79 GiB, estimated peak ~133.51 MiB (mode perf), max x ~1.4e+21
 build     DIV32 ON, AVX512 OFF, AVX2/BMI2/POPCNT on, threads 8
-build   (shared ctx, built once)            [1.517 s]
-Phi0  = 64014967544662                       [164 ms]
-Sigma = 514634213323316                      [3 ms]
-AC    = 9336325709491971                     [19.910 s]
-B     = -9158014307746509                    [6.093 s]
-D     = 23982993705127420                    [19.323 s]
-pi(x) = 24739954287740860                    [45.493 s, +1.517 s build]
+build   (shared ctx, built once)  [1.487 s]
+Phi0   = 64014967544662  [149 ms]
+Sigma  = 514634213323316  [3 ms]
+AC     = 9336325709491971  [17.597 s]
+B      = -9158014307746509  [5.361 s]
+D      = 23982993705127420  [16.262 s]
+pi(x)  = 24739954287740860  [39.373 s, +1.487 s build]
 ```
 
 ## Benchmark
 
 Chemin rapide mono-thread sous 10¹¹ ; algorithme de Gourdon (tous cœurs) au-delà.
-Temps wall-clock et **pic mémoire résidente** (`/usr/bin/time -v`, Maximum RSS).
+Temps wall-clock et **pic mémoire résidente** (`/usr/bin/time -v`, Maximum RSS) ;
+les temps sont le meilleur de plusieurs runs à froid (ce portable 45 W throttle
+sur les runs de plusieurs minutes, donc 10¹⁹ varie de ±~15 %).
 
 **Machine :** Intel Core i5-9300HF (Coffee Lake, 4C / 8T, AVX2), 8 threads,
 DIV32 activé automatiquement.
@@ -142,11 +144,11 @@ DIV32 activé automatiquement.
 | 10¹²  | 37 607 912 018        | 17 ms     | 8,4 MiB    |
 | 10¹³  | 346 065 536 839       | 47 ms     | 9,3 MiB    |
 | 10¹⁴  | 3 204 941 750 802     | 120 ms    | 10,7 MiB   |
-| 10¹⁵  | 29 844 570 422 669    | 0,52 s    | 14,5 MiB   |
-| 10¹⁶  | 279 238 341 033 925   | 2,21 s    | 24,9 MiB   |
-| 10¹⁷  | 2 623 557 157 654 233 | 10,20 s   | 52,6 MiB   |
-| 10¹⁸  | 24 739 954 287 740 860 | 46,41 s  | 125,0 MiB  |
-| 10¹⁹  | 234 057 667 276 344 607 | 220,7 s | 321,7 MiB  |
+| 10¹⁵  | 29 844 570 422 669    | 0,51 s    | 14,5 MiB   |
+| 10¹⁶  | 279 238 341 033 925   | 2,13 s    | 24,8 MiB   |
+| 10¹⁷  | 2 623 557 157 654 233 | 10,20 s   | 52,5 MiB   |
+| 10¹⁸  | 24 739 954 287 740 860 | 43,93 s  | 125,0 MiB  |
+| 10¹⁹  | 234 057 667 276 344 607 | 220,7 s | 321,6 MiB  |
 
 (Chemin `--perf` par défaut.) Le chemin **`--ram`** échange ~1,15–1,2× le temps
 contre un pic en O(x^(1/3)) ; pic RSS mesuré 25,8 / 48,6 / 108,8 / 270,1 MiB à
