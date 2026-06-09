@@ -45,7 +45,7 @@ struct PhiTiny {
       // NO division) then a single prefix-count pass — instead of testing
       // coprime(r) with `a` modulos per r. The old test was ~3.5M hardware idiv
       // at a=7 (P=510510) with a RUNTIME divisor, which dominated the small-x
-      // fixed cost on slow-divider CPUs (i5-9300HF: PhiTiny ctor ~13 ms). Same
+      // fixed cost on slow-divider CPUs (PhiTiny ctor ~13 ms there). Same
       // table values, built division-free.
       std::vector<char> nc(P, 0); // nc[r] = 1 iff some p_i divides r
       for (int i = 1; i <= a; ++i) {

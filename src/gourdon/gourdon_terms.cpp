@@ -42,18 +42,22 @@ size_t upper_index(const std::vector<int64_t>& primes, int64_t v) {
 
 // Fast non-negative 64/64 division emitting `divl` (64-bit / 32-bit -> 32-bit)
 // when BOTH the divisor and the quotient fit in 32 bits (the runtime test
-// high32(x) < d guarantees no #DE overflow). On some pre-2020 x86 CPUs the
-// 64-bit `divq` is slow/non-pipelined and dominates the easy-leaf terms A/C;
-// `divl` can be much faster.
+// high32(x) < d guarantees no #DE overflow). On pre-2020 x86 with a slow,
+// non-pipelined 64-bit `divq`, that division dominates the easy-leaf terms A/C
+// (IPC ~0.78); `divl` is much faster there: measured A/C -14.5%, full pi(x)
+// -21.8% at 1e16 on such a host.
 // The A/C leaves have quotient ~sqrt(x)
 // (< 2^32 up to ~1e19) and a prime/product divisor, so divl covers most of them.
 //
 // GATED behind ENABLE_DIV32 (CMake -DWITH_DIV32=ON), OFF by default. Unlike the
 // reference -- whose template selects divl at COMPILE time from a 32-bit divisor
-// TYPE, paying nothing extra -- this divisor is a 64-bit runtime value, so the
+// TYPE, paying nothing extra -- our divisor is a 64-bit runtime value, so the
 // fast path costs a `d <= 2^32 && high < d` branch per call. On a fast divider
-// divl may buy nothing and that branch is pure overhead, hence the CMake
-// configure-time probe.
+// (divq IPC ~2.3) divl buys nothing and that branch is pure overhead: measured
+// A/C +2.7% (1e16) / +3.2% (1e17) REGRESSION on a recent big-core x86. So
+// slow-divider hosts build with -DWITH_DIV32=ON, fast-divider hosts keep the
+// default (plain x/d, byte-identical to pristine) -- the configure-time probe
+// picks the right one automatically.
 
 #if defined(ENABLE_DIV32)
 #pragma message("A/C division backend: 32-bit divl (ENABLE_DIV32 / WITH_DIV32=ON)")
@@ -162,7 +166,7 @@ void presieve_fill_avx2(uint64_t* out, int64_t nw, const PreTable* pre, int ng,
   })
 }
 
-// 8-wide variant for AVX-512F; dispatched at runtime.
+// 8-wide variant for AVX-512F (CPUs that support it); dispatched at runtime.
 __attribute__((target("avx512f"))) void
 presieve_fill_avx512(uint64_t* out, int64_t nw, const PreTable* pre, int ng,
                      int64_t low) {
@@ -197,12 +201,86 @@ inline void presieve_fill(uint64_t* out, int64_t nw, const PreTable* pre, int ng
 //   primes   — all primes <= sqrt x.
 //   mp/pmax  — mu(m)*pmin(m) and largest prime factor of m, for m <= z.
 //              int32 (values are <= z < 2^31 for x <= ~1e19) halves their RAM.
+// Packed 24-bit signed store for mu(m)*pmin(m): 3 bytes/entry (vs int32's 4 = -25%
+// RAM). Safe because pmin is only ever compared to p_b <= x*, so it is capped at
+// x*+1 at build time (|value| < 2^23 for x < ~5e27). Used by the low-mem context;
+// the default keeps the plain int32 `mp` (no decode cost on the hot D path).
+inline void mp3_set(std::vector<uint8_t>& d, int64_t m, int32_t v) {
+  const uint32_t u = static_cast<uint32_t>(v) & 0xFFFFFFu;
+  d[3 * m] = static_cast<uint8_t>(u);
+  d[3 * m + 1] = static_cast<uint8_t>(u >> 8);
+  d[3 * m + 2] = static_cast<uint8_t>(u >> 16);
+}
+inline int32_t mp3_get(const std::vector<uint8_t>& d, int64_t m) {
+  const uint32_t u = static_cast<uint32_t>(d[3 * m]) |
+                     (static_cast<uint32_t>(d[3 * m + 1]) << 8) |
+                     (static_cast<uint32_t>(d[3 * m + 2]) << 16);
+  return (u & 0x800000u) ? static_cast<int32_t>(u | 0xFF000000u)
+                         : static_cast<int32_t>(u);
+}
+
+// --- Wheel-2310 coprime indexing for the D factor table (PC_DFACTOR) ---
+// Christian Bau's compressed-factor-table idea (as in primecount's FactorTableD):
+// store one entry per integer coprime to 2,3,5,7,11. to_index/to_number map between
+// a number and its dense coprime index (480 coprimes per 2310-period). Lets D's leaf
+// scan walk CONTIGUOUS indices (no wheel-stepping arithmetic) and read a contiguous
+// uint16 array, instead of wheel-stepping over mp3 with a 3-byte decode.
+struct Wheel2310 {
+  uint16_t coprime[480];   // coprime[i] = i-th integer coprime to 2310 in [1,2310]
+  int16_t cindex[2310];    // cindex[r] = index of the largest coprime <= r (or -1)
+  Wheel2310() {
+    int i = -1;
+    for (int r = 0; r < 2310; ++r) {
+      if (r % 2 && r % 3 && r % 5 && r % 7 && r % 11)
+        coprime[++i] = static_cast<uint16_t>(r);
+      cindex[r] = static_cast<int16_t>(i);
+    }
+  }
+};
+inline const Wheel2310& wheel2310() {
+  static const Wheel2310 t;
+  return t;
+}
+inline int64_t dfac_to_index(int64_t n) {
+  const Wheel2310& t = wheel2310();
+  return 480 * (n / 2310) + t.cindex[n % 2310];
+}
+inline int64_t dfac_to_number(int64_t idx) {
+  const Wheel2310& t = wheel2310();
+  return 2310 * (idx / 480) + t.coprime[idx % 480];
+}
+
+// Sum of set bits over n bytes at p, uint64-chunked (8 bytes per popcnt). D's phi
+// counter (count_le / prefix_bytes) popcounts ~24 bytes per survivor, so this is ~8x
+// fewer popcnt ops + 8x fewer loads than byte-by-byte. Inlined + portable (POPCNT64,
+// so the AVX2-only i5 benefits too). AVX512 vpopcntdq is NOT used here: the per-call
+// run (~24 B) is below its 64-B granularity and a target-attr function would not
+// inline (a call per survivor would cost more than it saves).
+inline int64_t popcount_bytes(const uint8_t* p, int64_t n) {
+  int64_t c = 0, i = 0;
+  for (; i + 8 <= n; i += 8) {
+    uint64_t w;
+    std::memcpy(&w, p + i, 8);
+    c += std::popcount(w);
+  }
+  for (; i < n; ++i)
+    c += std::popcount(p[i]);
+  return c;
+}
+
 struct GCtx {
   GParams p;
   PiTable pi;
   std::vector<int64_t> primes;
-  std::vector<int32_t> mp;
-  std::vector<int32_t> pmax;
+  std::vector<int32_t> mp;   // mu(m)*pmin(m), int32 (default path)
+  std::vector<int32_t> pmax; // largest prime factor (only when z != y)
+  std::vector<uint8_t> mp3;  // packed 24-bit variant of mp (low-mem path; mp empty)
+
+  // mu(m)*min(pmin(m), x*+1), 0 if m not squarefree. Reads whichever store is
+  // populated; the branch is loop-invariant so it predicts away on the hot path.
+  int32_t mpv(int64_t m) const {
+    return mp.empty() ? mp3_get(mp3, m) : mp[m];
+  }
 };
 
 GCtx build_ctx(int128_t x, int nt = 0) {
@@ -327,6 +405,93 @@ GCtx build_ctx_d_only(int128_t x, int nt, int64_t d_pi_limit) {
   return GCtx{p, std::move(pi), std::move(primes), std::move(mp), std::move(pmax)};
 }
 
+// Largest pi() argument Sigma needs OTHER than pi(sqrt x) (gourdon.md §4). Every
+// swept arg (x/(q*y), x/q^2, isqrt(x/q) for xstar < q <= x^(1/3)) and singleton
+// (pi(y), pi(x13), pi(isqrt(x/y)), pi(x*)) is <= this bound, which is O(x^(3/8)) —
+// far below sqrt x. pi(sqrt x) itself is supplied as a scalar via pi_count_seg.
+inline int64_t sigma_pi_limit(const GParams& p, int128_t x) {
+  const int64_t sxy = isqrt(x / p.y);
+  return std::max<int64_t>(
+      {p.x13, p.y, sxy, p.xstar,
+       divx(x, static_cast<int128_t>(p.xstar) * p.y), // max x/(q*y), q > x*
+       isqrt(x / p.xstar)});                          // max isqrt(x/q), q > x*
+}
+
+// LOW-MEMORY unified context (no O(sqrt x) PiTable): mp[] (O(x^(1/3)), needed by C
+// and D) + small prime list + a small PiTable covering Sigma's args and D's phi_pi
+// acceleration (limit = max(sigma_pi_limit, d_pi_limit), all O(x^(3/8))). A, B, C
+// and Sigma never touch a sqrt-x structure here — they sieve windows on demand. So
+// peak RSS ~ mp[] (O(x^(1/3))) instead of O(sqrt x). Single context, no phasing.
+// C-sparse split threshold T: leaves with v <= T use the O(1) PiTable (bulk),
+// v > T use the value-segmented tail. T defaults to z; PC_CSPLIT=mult raises it to
+// mult*x13 (capped at x*^2, beyond which no C leaf exists). The tail dense-scan
+// cost is ~ (x/T)*Σ(1/pb), so larger T shrinks the tail ~1/T, at the price of a
+// PiTable up to T (~T/10 bytes). Keep T = O(x^(1/3)) to preserve the x^(1/3) RAM
+// slope (T grows as x^(1/3) via x13). Shared by build_ctx_lowmem (table size) and
+// c_impl_sparse (split point) so they always agree.
+inline int64_t c_split_T(const GParams& p) {
+  int64_t mult = 64; // default: T = 64*x13 (still O(x^(1/3))), tail ~4x smaller
+  if (const char* e = std::getenv("PC_CSPLIT"))
+    mult = std::atoll(e); // 0 disables the raise (T = z)
+  int64_t T = p.z;
+  if (mult > 0)
+    T = std::max<int64_t>(T, mult * p.x13);
+  const int64_t vmax =
+      static_cast<int64_t>(static_cast<int128_t>(p.xstar) * p.xstar);
+  return std::min<int64_t>(T, vmax);
+}
+
+GCtx build_ctx_lowmem(int128_t x, int nt, int64_t d_pi_limit) {
+  GParams p = make_gparams(x);
+  const int64_t z = p.z;
+  std::vector<int64_t> primes = generate_primes(ctx_pi_small(p, x));
+  const int64_t lim = std::max<int64_t>(
+      {sigma_pi_limit(p, x), d_pi_limit, c_split_T(p), 2});
+  PiTable pi(lim, nt);
+
+  if (z != p.y) {
+    // Non-default tuning (alpha_z != 1): pmax[] is needed and requires primes up to
+    // z (> x*+1 cap), which the capped store cannot identify. Fall back to int32 mp.
+    std::vector<int32_t> mp(z + 1, 1);
+    for (int64_t j = 2; j <= z; ++j)
+      if (mp[j] == 1)
+        for (int64_t i = j; i <= z; i += j)
+          mp[i] = (mp[i] == 1) ? static_cast<int32_t>(-j) : -mp[i];
+    for (int64_t j = 2; j * j <= z; ++j)
+      if (mp[j] == -j)
+        for (int64_t i = j * j; i <= z; i += j * j)
+          mp[i] = 0;
+    std::vector<int32_t> pmax(z + 1, 1);
+    for (int64_t pp = 2; pp <= z; ++pp)
+      if (mp[pp] == -pp)
+        for (int64_t i = pp; i <= z; i += pp)
+          pmax[i] = static_cast<int32_t>(pp);
+    return GCtx{p, std::move(pi), std::move(primes), std::move(mp),
+                std::move(pmax), {}};
+  }
+
+  // Default tuning (z == y): build the PACKED 24-bit mp directly (no transient
+  // int32 array), pmin capped at x*+1 (safe: every reader compares pmin to p_b <=
+  // x*; the squarefree pass uses only primes <= sqrt z < x*, unaffected by the cap).
+  const int64_t cap = static_cast<int64_t>(p.xstar) + 1;
+  std::vector<uint8_t> mp3(3 * (z + 1));
+  for (int64_t i = 0; i <= z; ++i)
+    mp3_set(mp3, i, 1);
+  for (int64_t j = 2; j <= z; ++j)
+    if (mp3_get(mp3, j) == 1)
+      for (int64_t i = j; i <= z; i += j) {
+        const int32_t cur = mp3_get(mp3, i);
+        mp3_set(mp3, i,
+                (cur == 1) ? -static_cast<int32_t>(std::min<int64_t>(j, cap))
+                           : -cur);
+      }
+  for (int64_t j = 2; j * j <= z; ++j)
+    if (mp3_get(mp3, j) == -j)
+      for (int64_t i = j * j; i <= z; i += j * j)
+        mp3_set(mp3, i, 0);
+  return GCtx{p, std::move(pi), std::move(primes), {}, {}, std::move(mp3)};
+}
+
 // --- Phi0 (gourdon.md §3) ---
 
 void phi0_rec(int128_t x, const std::vector<int64_t>& primes, int k, int64_t y,
@@ -351,9 +516,63 @@ maxint_t phi0_impl(int128_t x, const GCtx& c) {
   return acc;
 }
 
+// Count-only segmented sieve: returns pi(n) WITHOUT materializing an O(n) table.
+// `base` must contain every prime <= isqrt(n) (a small list, <= x^(1/4) here).
+// O(n) time (parallel over segments), O(window) memory. Used to get pi(sqrt x)
+// in the low-memory path where no full sqrt-x PiTable exists (gourdon.md §4: the
+// single pi(sqrt x) value Sigma0 needs).
+int64_t pi_count_seg(int64_t n, const std::vector<int64_t>& base, int nt) {
+  if (n < 2)
+    return 0;
+  const size_t nsieve = upper_index(base, isqrt(n));
+  int64_t Slog = 20;
+  if (const char* e = std::getenv("PC_PICOUNTLOG"))
+    Slog = std::atoi(e);
+  const int64_t S = int64_t(1) << Slog;
+  const int64_t V0 = 2;
+  const int64_t nseg = (n - V0) / S + 1;
+  int64_t total = 0;
+#pragma omp parallel num_threads(nt) reduction(+ : total)
+  {
+    const int64_t NW = (S + 63) / 64;
+    std::vector<uint64_t> bits(NW + 1);
+#pragma omp for schedule(dynamic)
+    for (int64_t seg = 0; seg < nseg; ++seg) {
+      const int64_t low = V0 + seg * S;
+      const int64_t high = std::min<int64_t>(low + S, n + 1);
+      const int64_t len = high - low;
+      const int64_t nw = (len + 63) / 64;
+      std::fill(bits.begin(), bits.begin() + nw, ~uint64_t(0));
+      if (len & 63)
+        bits[nw - 1] &= (uint64_t(1) << (len & 63)) - 1;
+      for (size_t si = 0; si < nsieve; ++si) {
+        const int64_t pp = base[si];
+        if (pp * pp >= high)
+          break;
+        int64_t k = (low + pp - 1) / pp;
+        if (k < 2)
+          k = 2;
+        for (int64_t m = pp * k; m < high; m += pp) {
+          const int64_t pos = m - low;
+          bits[pos >> 6] &= ~(uint64_t(1) << (pos & 63));
+        }
+      }
+      int64_t run = 0;
+      for (int64_t w = 0; w < nw; ++w)
+        run += std::popcount(bits[w]);
+      total += run;
+    }
+  }
+  return total;
+}
+
 // --- Sigma (gourdon.md §4) ---
 
-maxint_t sigma_impl(int128_t x, const GCtx& c) {
+// pisqrtx: pi(sqrt x). Pass >= 0 to supply it as a scalar (low-mem path, where
+// c.pi only reaches ~O(x^(1/3)) and cannot answer pi(sqrt x)); pass -1 to read it
+// from the full c.pi (legacy path). Every OTHER pi() arg here is <= sigmaLimit
+// (gourdon.md §4), so the small c.pi covers them.
+maxint_t sigma_impl(int128_t x, const GCtx& c, int128_t pisqrtx = -1) {
   const GParams& p = c.p;
   const PiTable& pi = c.pi;
 
@@ -362,7 +581,7 @@ maxint_t sigma_impl(int128_t x, const GCtx& c) {
   const int64_t sxy = isqrt(x / p.y);
   const int128_t cc = pi(sxy);
   const int128_t dd = pi(p.xstar);
-  const int128_t pisx = pi(p.sqrtx);
+  const int128_t pisx = (pisqrtx >= 0) ? pisqrtx : pi(p.sqrtx);
 
   int128_t S0 = a - 1 + pisx * (pisx - 1) / 2 - a * (a - 1) / 2;
   int128_t S1 = (a - b) * (a - b - 1) / 2;
@@ -518,6 +737,12 @@ maxint_t a_impl(int128_t x, const GCtx& c, int nt) {
   const GParams& p = c.p;
   const size_t lo = upper_index(c.primes, p.xstar); // p_b > x*
   const size_t hi = upper_index(c.primes, p.x13);   // p_b <= x^(1/3)
+  // NB: libdivide (branchfree reciprocal per prime q) was tried here to replace the
+  // per-leaf divq — it REGRESSED on a fast-divider CPU (AC 2.64->2.95s @1e18). A
+  // modern hardware divq (~14 cyc, pipelined) is fast enough that AC is NOT
+  // division-bound there (the ~3% `div` samples are throughput, not a stall);
+  // libdivide just adds a recip load + multiply chain. The reference's ~2.5x AC lead
+  // is AVX512 + a segmented (cache-local) PiTable, not libdivide here. Reverted.
 
   maxint_t sum = 0;
 #pragma omp parallel for schedule(dynamic, 16) reduction(i128add : sum)        \
@@ -543,6 +768,85 @@ maxint_t a_impl(int128_t x, const GCtx& c, int nt) {
   return sum;
 }
 
+// --- Local prime helpers for the low-memory B (no sqrt-x PiTable bitmap) ---
+//
+// B iterates the primes p in (y, sqrt x] and needs pi(sqrt x). The legacy path
+// reads them from the shared O(sqrt x) PiTable bitmap; the low-mem path derives
+// them on the fly. `base` must hold every prime <= isqrt(n) (n <= sqrt x here, so
+// isqrt(n) <= x^(1/4) <= base max — base = c.primes covers it).
+
+// Largest prime <= n (0 if none). Trial division; n is small (<= sqrt x).
+inline int64_t prime_le_local(int64_t n, const std::vector<int64_t>& base) {
+  for (int64_t m = n; m >= 2; --m) {
+    bool prime = true;
+    for (int64_t pp : base) {
+      if (pp * pp > m)
+        break;
+      if (m % pp == 0) { prime = false; break; }
+    }
+    if (prime)
+      return m;
+  }
+  return 0;
+}
+
+// Smallest prime > n, searching up to cap (0 if none in (n, cap]).
+inline int64_t prime_gt_local(int64_t n, int64_t cap,
+                              const std::vector<int64_t>& base) {
+  for (int64_t m = n + 1; m <= cap; ++m) {
+    bool prime = true;
+    for (int64_t pp : base) {
+      if (pp * pp > m)
+        break;
+      if (m % pp == 0) { prime = false; break; }
+    }
+    if (prime)
+      return m;
+  }
+  return 0;
+}
+
+// All primes in [lo, hi] (ascending) into `out`, via a segmented bit-sieve crossing
+// the base primes <= isqrt(hi). `bits` is a reusable scratch buffer. The leaf p-range
+// of one B segment has width <= S, so this is O(S) per segment — same order as B's
+// own sieve, and O(window) memory (no sqrt-x structure).
+inline void primes_in_range(int64_t lo, int64_t hi,
+                            const std::vector<int64_t>& base,
+                            std::vector<uint64_t>& bits,
+                            std::vector<int64_t>& out) {
+  out.clear();
+  if (hi < 2 || hi < lo)
+    return;
+  if (lo < 2)
+    lo = 2;
+  const int64_t len = hi - lo + 1;
+  const int64_t nw = (len + 63) / 64;
+  if (static_cast<int64_t>(bits.size()) < nw)
+    bits.resize(nw);
+  std::fill(bits.begin(), bits.begin() + nw, ~uint64_t(0));
+  if (len & 63)
+    bits[nw - 1] &= (uint64_t(1) << (len & 63)) - 1;
+  for (int64_t pp : base) {
+    if (pp * pp > hi)
+      break;
+    int64_t k = (lo + pp - 1) / pp;
+    if (k < 2)
+      k = 2;
+    for (int64_t m = pp * k; m <= hi; m += pp) {
+      const int64_t pos = m - lo;
+      bits[pos >> 6] &= ~(uint64_t(1) << (pos & 63));
+    }
+  }
+  for (int64_t w = 0; w < nw; ++w) {
+    uint64_t b = bits[w];
+    while (b) {
+      const int bit = std::countr_zero(b);
+      out.push_back(lo + (w << 6) + bit);
+      b &= b - 1;
+    }
+  }
+}
+
 // --- B, wheel-30 sieve variant (gourdon.md §8) ---
 //
 // Same algorithm as b_impl but the segment sieve uses a WHEEL-30 layout: only the
@@ -553,17 +857,23 @@ maxint_t a_impl(int128_t x, const GCtx& c, int nt) {
 // with per-prime precomputed (byte-delta, clear-mask) tables, so the inner loop
 // has NO division or %30 (the bit-per-integer b_impl crossing — the bit-clears —
 // was ~37% of B). Selected with PC_BWHEEL.
-maxint_t b_impl_wheel(int128_t x, const GCtx& c, int nt) {
+// pisqrtx: pi(sqrt x). Pass >= 0 for the LOW-MEM path (no sqrt-x PiTable): primes
+// in (y, sqrt x] and the base pi(sqrt x) are then derived by local sieving instead
+// of reading c.pi. Pass -1 for the legacy path (reads the shared bitmap).
+maxint_t b_impl_wheel(int128_t x, const GCtx& c, int nt, int128_t pisqrtx = -1) {
   const GParams& p = c.p;
   const int64_t sqrtx = p.sqrtx;
   const int64_t y = p.y;
-  // B walks the primes p in (y, sqrt x] via the PiTable bitmap (prime_le / pi()),
-  // NOT a stored O(sqrt x) int64 prime LIST. Only the small crossing / pre-sieve
-  // primes (<= x^(1/3)) still come from c.primes.
-  const int64_t p_top = c.pi.prime_le(sqrtx); // largest prime <= sqrt x
+  const bool lowmem = pisqrtx >= 0;
+  // B walks the primes p in (y, sqrt x]. Legacy: via the PiTable bitmap (prime_le /
+  // pi()). Low-mem: via local sieves (prime_le_local / primes_in_range) so no
+  // O(sqrt x) structure is needed. Small crossing primes (<= x^(1/3)) come from
+  // c.primes in both cases.
+  const int64_t p_top =
+      lowmem ? prime_le_local(sqrtx, c.primes) : c.pi.prime_le(sqrtx);
   if (p_top <= y)
     return 0;
-  const int64_t base = c.pi(sqrtx);
+  const int64_t base = lowmem ? static_cast<int64_t>(pisqrtx) : c.pi(sqrtx);
 
   // Wheel-30 cannot represent the primes 2, 3 and 5. They land inside the B
   // sieve range (sqrt x, Wmax] only when sqrt x < 5 (i.e. x < 25), where the
@@ -584,7 +894,8 @@ maxint_t b_impl_wheel(int128_t x, const GCtx& c, int nt) {
       return cnt;
     };
     maxint_t Bt = 0;
-    for (int64_t pp = p_top; pp > y; pp = c.pi.prime_le(pp - 1))
+    for (int64_t pp = p_top; pp > y;
+         pp = lowmem ? prime_le_local(pp - 1, c.primes) : c.pi.prime_le(pp - 1))
       Bt += pi_tiny(divx(x, pp));
     return Bt;
   }
@@ -595,13 +906,16 @@ maxint_t b_impl_wheel(int128_t x, const GCtx& c, int nt) {
     int64_t w = divx(x, cur_p);
     if (w > sqrtx)
       break;
-    B += c.pi(w);
-    cur_p = c.pi.prime_le(cur_p - 1);
+    // w = floor(x/cur_p) >= sqrt x (cur_p <= sqrt x) and <= sqrt x here, so w ==
+    // sqrt x exactly and pi(w) = pi(sqrt x). Low-mem uses the scalar directly.
+    B += lowmem ? static_cast<maxint_t>(pisqrtx) : static_cast<maxint_t>(c.pi(w));
+    cur_p = lowmem ? prime_le_local(cur_p - 1, c.primes) : c.pi.prime_le(cur_p - 1);
   }
   if (cur_p <= y)
     return B;
 
-  const int64_t Wmax = divx(x, c.pi.prime_gt(y)); // x / (first prime > y)
+  const int64_t Wmax = divx(
+      x, lowmem ? prime_gt_local(y, 2 * y + 100, c.primes) : c.pi.prime_gt(y));
   const int64_t W0 = sqrtx + 1;
 
   // Wheel-30 residue tables (built once per call; 30 entries).
@@ -700,6 +1014,8 @@ maxint_t b_impl_wheel(int128_t x, const GCtx& c, int nt) {
 #pragma omp parallel num_threads(nt)
   {
     std::vector<uint8_t> sb(S / 30 + 32);
+    std::vector<uint64_t> pbits; // low-mem: scratch for primes_in_range
+    std::vector<int64_t> pbuf;   // low-mem: primes p of this segment (ascending)
 #pragma omp for schedule(dynamic)
     for (int64_t seg = 0; seg < nseg; ++seg) {
       const int64_t low = W0 + seg * S;
@@ -779,8 +1095,9 @@ maxint_t b_impl_wheel(int128_t x, const GCtx& c, int nt) {
       const int64_t p_low = std::max(y, divx(x, high));     // leaves: p > p_low
       const int64_t p_high = std::min(cur_p, divx(x, low));  //         p <= p_high
       int64_t acc = 0, cb = 0, part = 0, nl = 0;
-      for (int64_t pp = c.pi.prime_le(p_high); pp > p_low;
-           pp = c.pi.prime_le(pp - 1)) { // w ascending (p descending)
+      // One leaf p (w = x/p ascending => p descending), counting pi(w) via the
+      // running byte cursor: pi(w) = base + (primes counted so far this segment).
+      auto leaf = [&](int64_t pp) {
         const int64_t w = divx(x, pp);
         const int64_t wb = w / 30 - wlo;
         for (; cb + 8 <= wb; cb += 8)
@@ -790,6 +1107,16 @@ maxint_t b_impl_wheel(int128_t x, const GCtx& c, int nt) {
         part += base + acc +
                 std::popcount(static_cast<unsigned>(sb[wb] & endT[w % 30]));
         ++nl;
+      };
+      if (lowmem) {
+        // Local sieve of this segment's p-range (width <= S), then descend.
+        primes_in_range(p_low + 1, p_high, c.primes, pbits, pbuf);
+        for (size_t pj = pbuf.size(); pj-- > 0;)
+          leaf(pbuf[pj]); // pbuf ascending -> iterate reverse for p descending
+      } else {
+        for (int64_t pp = c.pi.prime_le(p_high); pp > p_low;
+             pp = c.pi.prime_le(pp - 1))
+          leaf(pp);
       }
       int64_t sc = acc, b2 = cb;
       for (; b2 + 8 <= nbytes; b2 += 8)
@@ -844,14 +1171,14 @@ maxint_t b_impl(int128_t x, const GCtx& c, int nt) {
     const int64_t W0 = sqrtx + 1;
     // Segment size — same cache-level-adaptive rule as d_impl (see its comment):
     // B's per-thread working set is the bit sieve (S/8 bytes). On big-L2 / high-
-    // bandwidth cores an L1d-resident S wins (measured optimum 2^17-2^18 here),
-    // on small-L2 Intel the old L2-resident S (2^20). Branch on L2 size; override
+    // bandwidth cores an L1d-resident S wins (measured optimum 2^17-2^18), on
+    // small-L2 cores the L2-resident S (2^20). Branch on L2 size; override
     // with PC_BSEGLOG.
     const long l1d_b = sysconf(_SC_LEVEL1_DCACHE_SIZE);
     const long l2_b = sysconf(_SC_LEVEL2_CACHE_SIZE);
     int64_t Bslog, bcap;
     if (l2_b > 0 && l2_b <= 384 * 1024) {
-      Bslog = 20; // L2-resident small-cache tuning
+      Bslog = 20; // L2-resident (small-L2 tuning)
       bcap = 1024;
     } else {
       // Unlike D, B has no per-segment phi_start recompute (just two binary
@@ -996,8 +1323,8 @@ struct CRec {
   // m > mlo. One node per valid leaf instead of scanning (and rejecting ~95% of)
   // every integer in (mlo, mhi]. mu = (-1)^#factors; leaf adds -mu*(pi(v)-b+2).
   // MFITS=true: m*q is known to fit int64 (mhi*y < 2^63, i.e. x <= ~1e20 with
-  // z=y), so the product/compare stay int64. MFITS=false keeps the int128 path
-  // (high-x / huge z), so
+  // z=y), so the product/compare stay int64 — the int128 mul+cmp was ~26% of
+  // c_impl on a fast-divider host. MFITS=false keeps the int128 path (high-x / huge z), so
   // there is no overflow even if the x>1e20 guardrail is bypassed.
   template <bool MFITS>
   void rec(size_t start, int64_t m, int sign) {
@@ -1047,7 +1374,13 @@ struct CRec {
 // and b = ib+1 depends on p_b (NOT the segment). So pi(v)=running+lc(v) splits the
 // per-segment fold into THREE accumulators: sum coeff*lc(v) (the local-count part),
 // sum coeff (multiplies running), and sum coeff*(2-b) (the per-p_b constant part).
-maxint_t c_impl_seg(int128_t x, const GCtx& c, int nt) {
+// Value-segmented C (gourdon.md §6) with no full PiTable. Optional [v_from, .)
+// restriction: when v_from > 2 only leaves with v >= v_from are emitted (the
+// value sweep starts at v_from), and running_init must be pi(v_from - 1) so the
+// running prime count is correct for the first segment. Defaults reproduce the
+// full C over [2, x*^2] (the oracle for PC_CSEG and c_impl_sparse's tail).
+maxint_t c_impl_seg(int128_t x, const GCtx& c, int nt, int64_t v_from = 2,
+                    int64_t running_init = 0) {
   const GParams& p = c.p;
   const size_t lo = static_cast<size_t>(p.k);     // p_b > p_k
   const size_t hi = upper_index(c.primes, p.xstar); // p_b <= x*
@@ -1064,7 +1397,9 @@ maxint_t c_impl_seg(int128_t x, const GCtx& c, int nt) {
   if (const char* e = std::getenv("PC_CSEGLOG"))
     Slog = std::atoi(e);
   const int64_t S = int64_t(1) << Slog;
-  const int64_t V0 = 2;
+  const int64_t V0 = std::max<int64_t>(2, v_from);
+  if (V0 > Vmax)
+    return 0;
   const int64_t nseg = (Vmax - V0) / S + 1;
   const size_t nsieve = upper_index(c.primes, isqrt(Vmax));
 
@@ -1131,7 +1466,7 @@ maxint_t c_impl_seg(int128_t x, const GCtx& c, int nt) {
         const int64_t twob = 2 - b;
         int64_t part_pb = 0, csum_pb = 0, cbsum_pb = 0;
         for (int64_t m = m_lo; m <= m_hi; ++m) {
-          const int32_t mv = c.mp[m];
+          const int32_t mv = c.mpv(m);
           if (mv == 0)
             continue; // not squarefree
           const int64_t pmin = mv < 0 ? -mv : mv;
@@ -1165,12 +1500,97 @@ maxint_t c_impl_seg(int128_t x, const GCtx& c, int nt) {
   // pi(v)=running+lc, so sum coeff*(pi(v)-b+2) = sum coeff*lc + running*sum coeff
   //                                              + sum coeff*(2-b).
   maxint_t C = 0;
-  int64_t running = 0;
+  int64_t running = running_init;
   for (int64_t seg = 0; seg < nseg; ++seg) {
     C += seg_partial[seg] + static_cast<int128_t>(running) * seg_csum[seg] +
          seg_cbsum[seg];
     running += seg_pcount[seg];
   }
+  return C;
+}
+
+// SPARSE C (low-mem): inverts the dense per-(p_b, m) scan to m-outer, removing
+// both the ~2720x re-scan of each m and the ~94% squarefree/lpf rejection. Split
+// by leaf value v = x/(p_b*m):
+//   * BULK (v <= z, ~90% of leaves, growing with x): enumerate squarefree m once
+//     (m = 2..z, skip mpv==0); for each, the valid p_b form a contiguous prime
+//     range; emit coeff*(pi(v) - b + 2) with pi(v) = c.pi.at(v) (O(1), the small
+//     PiTable up to z that build_ctx_lowmem already holds; no running-count needed
+//     since pi(v) is absolute). Membership decided by the ORIGINAL integer
+//     predicates (mlo<m<=mhi, pmin>pb) so it is bit-exact with the dense scan.
+//   * TAIL (v > z, ~10%): the value-segmented dense scan over (z, x*^2], reusing
+//     c_impl_seg with running_init = pi(z). Its value-segmentation visits only the
+//     small-m (v>z) sub-ranges, ~15% of the original m-scan.
+// C = C_bulk + C_tail (partition by v; every valid leaf counted exactly once).
+maxint_t c_impl_sparse(int128_t x, const GCtx& c, int nt) {
+  const GParams& p = c.p;
+  const int64_t z = p.z;
+  const int64_t y = p.y;
+  const int64_t xstar = p.xstar;
+  const size_t lo = static_cast<size_t>(p.k);       // p_b > p_k  (index >= lo)
+  const size_t hi = upper_index(c.primes, xstar);   // p_b <= x*
+  if (lo >= hi || z < 2)
+    return 0;
+  const int64_t T = c_split_T(p); // bulk serves v <= T, tail serves v > T
+  // Bulk needs pi(v) for v <= T. build_ctx_lowmem sizes pi.limit() >= T; fall back
+  // to the dense oracle if some tuning left it short (rare).
+  if (c.pi.limit() < T)
+    return c_impl_seg(x, c, nt);
+  const bool checkpmax = (p.z != p.y);
+  const bool prof = std::getenv("PC_LMPROF") != nullptr;
+  auto pclk = [] { return std::chrono::steady_clock::now(); };
+  auto pms = [](std::chrono::steady_clock::duration d) {
+    return std::chrono::duration<double, std::milli>(d).count();
+  };
+  auto tb0 = pclk();
+
+  // ---- C_bulk: v <= T, inverted m-outer ----
+  maxint_t C = 0;
+#pragma omp parallel for schedule(dynamic, 1 << 12) reduction(i128add : C)        \
+    num_threads(nt)
+  for (int64_t m = 2; m <= z; ++m) {
+    const int32_t mv = c.mpv(m);
+    if (mv == 0)
+      continue; // not squarefree
+    if (checkpmax && c.pmax[m] > y)
+      continue; // P^+(m) > y
+    const int64_t pmin = mv < 0 ? -mv : mv; // lpf(m)
+    const int64_t coeff = (mv < 0) ? 1 : -1; // -mu(m)
+    const int128_t xm = x / m;               // floor(x/m)
+    // The valid p_b for this m form a CONTIGUOUS prime range; every bound below is
+    // the exact integer equivalent of the dense scan's per-p_b predicate (so this
+    // is bit-exact, no per-p_b re-test):
+    //   m <= floor(x/pb^2)   <=> pb <= isqrt(floor(x/m))
+    //   m >  floor(x/pb^3)   <=> pb >  iroot3(floor(x/m))
+    //   m >  floor(z/pb)     <=> pb >  floor(z/m)
+    //   v=floor(x/(pb m))<=T <=> pb >  floor(x/((T+1) m))   (bulk = v<=T half)
+    //   P^-(m) > pb          <=> pb <  lpf(m);   plus p_k < pb <= x*.
+    const int64_t pbHi = std::min<int64_t>({isqrt(xm), pmin - 1, xstar});
+    const int64_t pbLo = std::max<int64_t>(
+        {static_cast<int64_t>(z / m), iroot<3>(xm),
+         divx(x, static_cast<int128_t>(T + 1) * m)});
+    if (pbHi <= pbLo)
+      continue;
+    const size_t ib_start = std::max(lo, upper_index(c.primes, pbLo));
+    const size_t ib_end = std::min(hi, upper_index(c.primes, pbHi));
+    int64_t part = 0;
+    for (size_t ib = ib_start; ib < ib_end; ++ib) {
+      const int64_t pb = c.primes[ib];
+      const int64_t v = divx(x, static_cast<int128_t>(pb) * m);
+      const int b = static_cast<int>(ib) + 1;
+      part += coeff * (c.pi.at(v) - b + 2);
+    }
+    C += static_cast<maxint_t>(part);
+  }
+  auto tb1 = pclk();
+
+  // ---- C_tail: v > T, value-segmented over (T, x*^2], running starts at pi(T) ----
+  const maxint_t Ctail = c_impl_seg(x, c, nt, T + 1, c.pi(T));
+  C += Ctail;
+  if (prof)
+    std::fprintf(stderr,
+        "[LMPROF c_sparse] T=%lld (z=%lld) bulk-wall=%.0fms tail-wall=%.0fms\n",
+        (long long)T, (long long)z, pms(tb1 - tb0), pms(pclk() - tb1));
   return C;
 }
 
@@ -1198,11 +1618,11 @@ maxint_t c_impl(int128_t x, const GCtx& c, int nt) {
     if (mhi > mlo) {
       CRec cr{x, x64, x64v, c.primes, c.pi, b, pb, mlo, mhi, p.y};
       // int64 vs int128 m*q is MACHINE-DIVERGENT (auto-gated on the divider probe,
-      // INVERSE of the divl lever): a SLOW divider (ENABLE_DIV32 on, e.g. i5) masks
-      // the int128 mul+compare so it is ~free and int64 templating is a net loss
-      // on slow-divider builds) -> always int128. A fast divider exposes the
-      // int128 cost -> int64 where it can't overflow (x<=~1e20), int128 above.
-      // int128 (rec<false>) is always correct.
+      // INVERSE of the divl lever): a SLOW divider (ENABLE_DIV32 on) masks the
+      // int128 mul+compare so it is ~free and int64 templating is a net loss
+      // (measured +2%) -> always int128. A FAST divider (ENABLE_DIV32 off) exposes
+      // the int128 cost -> int64 where it can't overflow (x<=~1e20), int128 above
+      // (-0.6%). int128 (rec<false>) is always correct.
 #if defined(ENABLE_DIV32)
       cr.rec<false>(ib + 1, 1, +1); // slow divider: int128 m*q is ~free
 #else
@@ -1250,25 +1670,24 @@ maxint_t d_impl_dense(int128_t x, const GCtx& c, int nt) {
   // erase/count memory traffic) stays in cache; each segment also recomputes
   // phi_start (O(bend)), so too small an S means too many segments. The optimum
   // cache LEVEL is microarchitecture-dependent, not just a function of size:
-  //   * Small-L2 CPUs (e.g. 256 KB L2, few cores, bandwidth-starved): an
+  //   * Small-L2, few-core, bandwidth-starved (e.g. ~256 KB L2, 4 cores): an
   //     L2-resident S (2^20, ~192 KB) wins — fewer, larger segments minimise the
   //     phi_start recompute that few cores can't hide. Measured D -42% at 1e15
   //     vs 2^22; optimum 2^20 at 1e15, 2^21 at 1e16.
-  //   * Big-L2 / high-bandwidth cores (e.g. 1 MB L2, many cores, AVX-512):
+  //   * Big-L2 / high-bandwidth, many-core (e.g. ~1 MB L2, 8 cores, AVX-512):
   //     an L1d-resident S (~3S/16 = L1d/2, i.e. 2^17) wins — abundant bandwidth
   //     and cores make the extra phi_start cheap, and the tighter working set
   //     cuts the dominant Fenwick traffic. Measured D -24% at 1e15, -22% at 1e16
   //     (optima 2^17 small x .. 2^21 at 1e17, reached via the nseg cap below).
   // We pick the regime by L2 size — the one signal that separates the two
-  // measured machines: <=384 KB L2 keeps the L2-resident rule (the measured
-  // measured small-cache boxes); otherwise the L1d-resident rule is a sane
-  // default for modern big-core CPUs. Re-measure and pin PC_DSEGLOG when tuning
-  // a new machine. PC_DSEGLOG overrides everything.
+  // measured classes: <=384 KB L2 keeps the L2-resident rule; otherwise the
+  // L1d-resident rule (a sane default for modern big-core CPUs — re-measure &
+  // pin PC_DSEGLOG on a new machine if it differs). PC_DSEGLOG overrides everything.
   const long l1d = sysconf(_SC_LEVEL1_DCACHE_SIZE);
   const long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
   int64_t Slog, capnseg;
   if (l2 > 0 && l2 <= 384 * 1024) {
-    Slog = 20;       // L2-resident small-cache tuning
+    Slog = 20;       // L2-resident (small-L2 tuning)
     capnseg = 1024;
   } else {
     const long l1 = (l1d > 0) ? l1d : 48 * 1024; // fallback 48 KB
@@ -1445,7 +1864,7 @@ maxint_t d_impl_dense(int128_t x, const GCtx& c, int nt) {
         };
         if (checkpmax) {
           for (int64_t m = mb; m >= ma; --m) {
-            const int64_t v0 = c.mp[m];
+            const int64_t v0 = c.mpv(m);
             const int64_t pmin = v0 < 0 ? -v0 : v0;
             if (pmin <= pb || c.pmax[m] > p.y)
               continue;
@@ -1453,7 +1872,7 @@ maxint_t d_impl_dense(int128_t x, const GCtx& c, int nt) {
           }
         } else {
           for (int64_t m = mb; m >= ma; --m) {
-            const int64_t v0 = c.mp[m];
+            const int64_t v0 = c.mpv(m);
             const int64_t pmin = v0 < 0 ? -v0 : v0;
             if (pmin <= pb)
               continue;
@@ -1549,6 +1968,37 @@ maxint_t d_impl_wheel(int128_t x, const GCtx& c, int nt) {
     endT[r] = sle;
   }
 
+  // m-loop wheel (SEPARATE from the mod-30 value-sieve wheel above): the leaf
+  // m-scan visits only m coprime to the first min(k,5) primes. Every such skipped
+  // m has lpf(m) <= 11 < p_{k+1} <= pb, so it is ALWAYS rejected (pmin <= pb) —
+  // skipping it is exact. Capped at primes <= 11 (Wm <= 2310) to keep the tables
+  // tiny and x-independent (the full k-wheel modulus explodes with k). vs the
+  // mod-30 scan this drops ~22% of the m-steps at 1e18 (k>=5). PC_DMWHEEL=0 forces
+  // the old mod-30 scan (oracle).
+  int nwp = std::min<int>(p.k, 5); // wheel primes = first nwp of {2,3,5,7,11}
+  if (const char* e = std::getenv("PC_DMWHEEL"))
+    nwp = std::min<int>(std::max<int>(3, std::atoi(e)), 5); // 3 => mod-30 oracle
+  static constexpr int kWP[5] = {2, 3, 5, 7, 11};
+  int Wm = 1;
+  for (int i = 0; i < nwp; ++i)
+    Wm *= kWP[i];
+  // FIXED stack arrays (Wm<=2310, Nm=phi(2310)=480): no heap/pointer indirection
+  // in the hot step (a std::vector here regressed the step ~3%). Sized to the cap.
+  int16_t slotTm[2310];          // residue -> coprime slot, or -1
+  int32_t RmTbl[480];            // coprime residues ascending
+  int Nm = 0;
+  for (int r = 0; r < Wm; ++r) {
+    bool cop = true;
+    for (int i = 0; i < nwp; ++i)
+      if (r % kWP[i] == 0) { cop = false; break; }
+    slotTm[r] = cop ? static_cast<int16_t>(Nm) : int16_t(-1);
+    if (cop) RmTbl[Nm++] = r;
+  }
+  int32_t GAPDNm[480]; // step DOWN from slot s to the previous coprime residue
+  for (int s = 0; s < Nm; ++s)
+    GAPDNm[s] = (s == 0) ? (RmTbl[0] + Wm - RmTbl[Nm - 1])
+                         : (RmTbl[s] - RmTbl[s - 1]);
+
   // Pre-sieve pattern: one period of "coprime to the first k primes" in the
   // wheel-30 byte layout. 2,3,5 are excluded by the layout, so only the primes
   // p_6..p_k = primes[3..k-1] are crossed; period = (p_1..p_k)/30 bytes.
@@ -1591,8 +2041,9 @@ maxint_t d_impl_wheel(int128_t x, const GCtx& c, int nt) {
   // chunk = clamp(s0/LBK + 1, 1, LBMAX) — tiny chunks over the heavy head (fine
   // balance), large chunks over the light tail (recompute amortised). If
   // cost(seg) ~ 1/seg then cost-per-chunk ~ 1/LBK ~ constant.
-  // LBK=16 (chunk = s0/16 + 1) is robust across the measured 1e15-1e18 range.
-  // Re-tune via PC_DLBK on a different core count if needed.
+  // LBK=16 (chunk = s0/16 + 1) measured optimal on a modern 8-core part across
+  // 1e15-1e18 (D -6% to -18% vs per-segment); robust at this constant. Re-tune
+  // via PC_DLBK on a different core count if needed.
   int64_t LBK = 16;
   if (const char* e = std::getenv("PC_DLBK"))
     LBK = std::max<int64_t>(1, std::atoll(e));
@@ -1601,10 +2052,61 @@ maxint_t d_impl_wheel(int128_t x, const GCtx& c, int nt) {
     LBMAX = std::max<int64_t>(1, std::atoll(e));
   std::atomic<int64_t> nextSeg{0};
 
+  // PC_DFACTOR: wheel-2310 compressed factor table for D's leaf scan. The scan then
+  // walks CONTIGUOUS coprime indices reading a uint16 array with a single-comparison
+  // filter (factor[idx] > pb), instead of wheel-stepping mp3 with a 3-byte decode.
+  // Derived from c.mpv so it reproduces the exact (pmin>pb) filter (cap included):
+  //   enc = 0                       if not squarefree
+  //       = dcap (odd, > x*)        if mu=-1 and lpf > x*  (always a prime here)
+  //       = lpf  (odd)              if mu=-1 and lpf <= x*
+  //       = lpf-1 (even)            if mu=+1 (then lpf <= sqrt z < x*)
+  // so factor[idx] > pb  <=>  lpf > pb (consecutive primes differ by >=2, pb>=19),
+  // and mu = (factor[idx] & 1) ? -1 : +1. Only for z==y (!checkpmax, mpf<=y is then
+  // automatic) and while dcap fits uint16 (x* < ~65534, x < ~1.8e19); else the mp3
+  // wheel scan below is used (still correct, just not accelerated).
+  const int64_t dcap = (p.xstar + 2) | 1; // odd, > x*+1; encodes capped primes (mu=-1)
+  // DEFAULT ON: the factor-table scan is bit-exact with and ~4x faster than the mp3
+  // wheel scan. Auto-falls back to the wheel path when z!=y (PC_AZ) or x*+1 exceeds
+  // uint16 (x >~ 1.8e19). PC_NODFACTOR forces the wheel path (oracle).
+  const bool usefac =
+      std::getenv("PC_NODFACTOR") == nullptr && !checkpmax && dcap < 65536;
+  std::vector<uint16_t> dfac;
+  if (usefac) {
+    const int64_t nidx = dfac_to_index(p.z);
+    dfac.assign(static_cast<size_t>(nidx) + 1, 0);
+    for (int64_t idx = 0; idx <= nidx; ++idx) {
+      const int64_t m = dfac_to_number(idx);
+      if (m < 2 || m > p.z)
+        continue; // idx 0 => m=1 (never a leaf); guard the tail past z
+      const int32_t v = c.mpv(m);
+      if (v == 0)
+        continue; // not squarefree -> 0 (already)
+      const int64_t mag = v < 0 ? -v : v; // |mpv| = min(lpf, x*+1)
+      uint16_t enc;
+      if (v < 0)                          // mu = -1
+        enc = (mag > p.xstar) ? static_cast<uint16_t>(dcap)  // capped prime (lpf>x*)
+                              : static_cast<uint16_t>(mag);  // lpf (odd) <= x*
+      else                                // mu = +1 (lpf <= sqrt z < x*, never capped)
+        enc = static_cast<uint16_t>(mag - 1);
+      dfac[idx] = enc;
+    }
+  }
+
   maxint_t D = 0;
   int64_t dlocmax = 0; // max |per-b int64 accumulator|, to confirm no overflow
-#pragma omp parallel num_threads(nt) reduction(i128add : D) reduction(max : dlocmax)
+  // Opt-in profiling (PC_DPROF): per-b time split fill / leaf-loop+flush / wheel
+  // crossing, to locate D's hot phase. Per-b clock reads, negligible overhead.
+  const bool dprof = std::getenv("PC_DPROF") != nullptr;
+  double pf_d_fill = 0, pf_d_leaf = 0, pf_d_cross = 0, pf_d_flush = 0;
+  double pf_d_div = 0, pf_d_cnt = 0;
+  int64_t pf_d_nleaf = 0, pf_d_nsurv = 0, pf_d_cntb = 0;
+#pragma omp parallel num_threads(nt) reduction(i128add : D) reduction(max : dlocmax) \
+    reduction(+ : pf_d_fill, pf_d_leaf, pf_d_cross, pf_d_flush, pf_d_div, pf_d_cnt, pf_d_nleaf, pf_d_nsurv, pf_d_cntb)
   {
+    auto dclk = [] { return std::chrono::steady_clock::now(); };
+    auto dms = [](std::chrono::steady_clock::duration d) {
+      return std::chrono::duration<double, std::milli>(d).count();
+    };
     std::vector<uint8_t> sb(NB + 32);
     std::vector<int32_t> cnt((NB >> LOG_BPB) + 2); // byte-block popcounts
     std::vector<int64_t> phi_start(bend + 1);
@@ -1650,6 +2152,8 @@ maxint_t d_impl_wheel(int128_t x, const GCtx& c, int nt) {
       for (int64_t seg = segLo; seg < segHi; ++seg) {
       const int64_t low = 1 + seg * S;
       const int64_t high = std::min<int64_t>(low + S, N + 1);
+      std::chrono::steady_clock::time_point tfill0;
+      if (dprof) tfill0 = dclk();
 
       // Fill the byte sieve from the periodic pre-sieve pattern (coprime to the
       // first k primes), then mask integers < low and >= high. Byte bi holds the
@@ -1689,8 +2193,8 @@ maxint_t d_impl_wheel(int128_t x, const GCtx& c, int nt) {
           cb_prev = cb_stop;
           cb_stop += BPB;
         }
-        for (int64_t bb = cb_prev; bb < wb; ++bb)
-          cb_count += std::popcount(sb[bb]);
+        if (dprof) pf_d_cntb += (wb - cb_prev);
+        cb_count += popcount_bytes(sb.data() + cb_prev, wb - cb_prev);
         cb_prev = wb;
         return cb_count;
       };
@@ -1701,7 +2205,10 @@ maxint_t d_impl_wheel(int128_t x, const GCtx& c, int nt) {
                std::popcount(static_cast<uint8_t>(sb[wb] & endT[v % 30]));
       };
 
+      if (dprof) pf_d_fill += dms(dclk() - tfill0);
       for (size_t b = static_cast<size_t>(p.k) + 1; b <= bend; ++b) {
+        std::chrono::steady_clock::time_point tleaf0;
+        if (dprof) tleaf0 = dclk();
         cb_i = 0, cb_sum = 0, cb_stop = BPB, cb_count = 0, cb_prev = 0; // reset
         const int64_t pb = c.primes[b - 1];
         // xpb = floor(x/pb). int128 only when WIDE (x>~1.6e20); else int64 (fast).
@@ -1731,51 +2238,73 @@ maxint_t d_impl_wheel(int128_t x, const GCtx& c, int nt) {
         // survivors are appended in m-DESCENDING order => xpb/m ASCENDING).
         // Survivors are stored as signed m: sign bit carries mu (m>0 always), so
         // the hot scan does a SINGLE store per iteration (no separate mu buffer).
+        // mbuf holds either signed m (wheel path: sign=mu) or a coprime INDEX
+        // (factor path: m=to_number(idx), mu from dfac[idx]&1). Decode per path;
+        // `usefac` is loop-invariant so the branch predicts away.
         auto flush = [&]() {
+          std::chrono::steady_clock::time_point tfl0, tfl1;
+          if (dprof) { tfl0 = dclk(); pf_d_nsurv += bn; }
           for (int64_t i = 0; i < bn; ++i) {
             const int64_t sm = mbuf[i];
-            const int64_t mm = sm < 0 ? -sm : sm;
+            const int64_t mm = usefac ? dfac_to_number(sm) : (sm < 0 ? -sm : sm);
             if constexpr (WIDE)
               vbuf[i] = static_cast<int64_t>(xpb / mm); // int128 div (rare)
             else
               vbuf[i] = fast_div_u(static_cast<uint64_t>(xpb),
                                    static_cast<uint64_t>(mm));
           }
+          if (dprof) { tfl1 = dclk(); pf_d_div += dms(tfl1 - tfl0); }
           for (int64_t i = 0; i < bn; ++i) {
-            const int mu = mbuf[i] < 0 ? -1 : 1;
+            const int mu = usefac ? ((dfac[mbuf[i]] & 1) ? -1 : 1)
+                                  : (mbuf[i] < 0 ? -1 : 1);
             const int64_t phival = ps + count_le(vbuf[i]);
             dloc -= static_cast<int64_t>(mu) * phival;
           }
           bn = 0;
+          if (dprof) { pf_d_cnt += dms(dclk() - tfl1); pf_d_flush += dms(dclk() - tfl0); }
         };
-        // Visit only m coprime to 30 (the only possible survivors), stepping the
-        // wheel DOWN from mb to ma. Start: largest coprime-to-30 m <= mb.
-        int64_t m = mb;
-        int sm = slotT[static_cast<int>(m % 30)];
-        while (sm < 0 && m >= ma) { // align to a coprime residue (<=5 steps)
-          --m;
-          sm = slotT[static_cast<int>(((m % 30) + 30) % 30)];
-        }
-        if (checkpmax) {
-          for (; m >= ma; m -= GAPDN[sm], sm = (sm + 7) & 7) {
-            const int64_t v0 = c.mp[m];
-            const int64_t pmin = v0 < 0 ? -v0 : v0;
-            mbuf[bn] = (v0 < 0) ? -m : m; // sign = mu, magnitude = m
-            bn += (pmin > pb) & (c.pmax[m] <= p.y); // branchless append
+        if (usefac) {
+          // FACTOR path: walk CONTIGUOUS coprime indices [lo_idx, hi_idx] (= the
+          // coprime m in [ma, mb]) reading dfac, single-comparison branchless append.
+          const int64_t hi_idx = dfac_to_index(mb);
+          const int64_t lo_idx = dfac_to_index(ma - 1) + 1; // first coprime >= ma
+          for (int64_t idx = hi_idx; idx >= lo_idx; --idx) {
+            mbuf[bn] = idx;                  // store the index; decode in flush
+            bn += (dfac[idx] > pb);          // factor[idx] > pb  <=>  lpf > pb
             if (bn >= MBUF - 1)
               flush();
           }
         } else {
-          for (; m >= ma; m -= GAPDN[sm], sm = (sm + 7) & 7) {
-            const int64_t v0 = c.mp[m];
-            const int64_t pmin = v0 < 0 ? -v0 : v0;
-            mbuf[bn] = (v0 < 0) ? -m : m; // sign = mu, magnitude = m
-            bn += (pmin > pb); // branchless append
-            if (bn >= MBUF - 1)
-              flush();
+          // WHEEL path (oracle): step the mod-Wm wheel DOWN over m in [ma, mb].
+          int64_t m = mb;
+          int sm = slotTm[static_cast<int>(m % Wm)];
+          while (sm < 0 && m >= ma) { // align to a coprime-to-Wm residue
+            --m;
+            sm = slotTm[static_cast<int>(((m % Wm) + Wm) % Wm)];
+          }
+          if (checkpmax) {
+            for (; m >= ma; m -= GAPDNm[sm], sm = (sm == 0 ? Nm - 1 : sm - 1)) {
+              const int64_t v0 = c.mpv(m);
+              const int64_t pmin = v0 < 0 ? -v0 : v0;
+              mbuf[bn] = (v0 < 0) ? -m : m; // sign = mu, magnitude = m
+              bn += (pmin > pb) & (c.pmax[m] <= p.y); // branchless append
+              if (bn >= MBUF - 1)
+                flush();
+            }
+          } else {
+            for (; m >= ma; m -= GAPDNm[sm], sm = (sm == 0 ? Nm - 1 : sm - 1)) {
+              const int64_t v0 = c.mpv(m);
+              const int64_t pmin = v0 < 0 ? -v0 : v0;
+              mbuf[bn] = (v0 < 0) ? -m : m; // sign = mu, magnitude = m
+              bn += (pmin > pb); // branchless append
+              if (bn >= MBUF - 1)
+                flush();
+            }
           }
         }
         flush();
+        std::chrono::steady_clock::time_point tcross0;
+        if (dprof) { pf_d_leaf += dms(dclk() - tleaf0); if (mb >= ma) pf_d_nleaf += (mb - ma + 1); tcross0 = dclk(); }
         D += static_cast<maxint_t>(dloc); // promote once per b
         { const int64_t aa = dloc < 0 ? -dloc : dloc; if (aa > dlocmax) dlocmax = aa; }
         // Carry phi_start forward: phi(high-1,b-1) = phi(low-1,b-1) + #set in the
@@ -1829,6 +2358,7 @@ maxint_t d_impl_wheel(int128_t x, const GCtx& c, int nt) {
         }
       cross_done:;
 #undef DXOFF
+        if (dprof) pf_d_cross += dms(dclk() - tcross0);
       } // b loop
       } // seg loop
     } // range loop (for(;;))
@@ -1840,6 +2370,21 @@ maxint_t d_impl_wheel(int128_t x, const GCtx& c, int nt) {
                  static_cast<long long>(dlocmax),
                  static_cast<long long>(INT64_MAX),
                  static_cast<double>(dlocmax) / 9.223372036854776e18);
+  if (dprof) {
+    const double tot = pf_d_fill + pf_d_leaf + pf_d_cross;
+    std::fprintf(stderr,
+        "[DPROF] thread-ms: fill=%.0f(%.1f%%) leaf+flush=%.0f(%.1f%%) "
+        "cross=%.0f(%.1f%%)\n"
+        "  within leaf+flush: scan=%.0f flush=%.0f (div=%.0f count_le=%.0f) | "
+        "m-steps=%.3eG survivors=%.3eG (%.1f%% pass) cntbytes=%.3eG (%.1f B/surv)\n",
+        pf_d_fill, tot ? 100 * pf_d_fill / tot : 0, pf_d_leaf,
+        tot ? 100 * pf_d_leaf / tot : 0, pf_d_cross,
+        tot ? 100 * pf_d_cross / tot : 0, pf_d_leaf - pf_d_flush, pf_d_flush,
+        pf_d_div, pf_d_cnt,
+        pf_d_nleaf / 1e9, pf_d_nsurv / 1e9,
+        pf_d_nleaf ? 100.0 * pf_d_nsurv / pf_d_nleaf : 0,
+        pf_d_cntb / 1e9, pf_d_nsurv ? (double)pf_d_cntb / pf_d_nsurv : 0);
+  }
   return D;
 }
 
@@ -1913,6 +2458,294 @@ maxint_t pi_gourdon_phased(int128_t x, int nt) {
   return a - b + c_term + d + phi0 + sigma;
 }
 
+// LOW-MEMORY assembly: ONE unified context with NO O(sqrt x) PiTable. A and C use
+// the segmented sweeps (a_impl_seg / c_impl_seg), B sieves its own primes, Sigma
+// uses a small table + the pi(sqrt x) scalar. Peak RSS ~ mp[] = O(x^(1/3)), so it
+// grows ~x^(1/3) (not ~sqrt x). Numerically identical to g_pi (same six terms).
+// FUSED segmented sweep over the leaf-value domain [2, Vmax]: computes A
+// (gourdon.md §5), C (§6) and pi(sqrt x) (Sigma0 / B base) in ONE pass, instead of
+// re-sieving [2, sqrt x] three times (a_impl_seg + c_impl_seg + pi_count_seg). Each
+// segment is sieved once; A's and C's leaves landing in it are folded with
+// pi(v) = running + local_count(v), and the running prime count yields pi(sqrt x).
+// Same values as a_impl_seg / c_impl_seg / pi_count_seg (their inner bodies, merged).
+void ac_pi_sweep(int128_t x, const GCtx& c, int nt, maxint_t& A_out,
+                 maxint_t& C_out, int128_t& pisqrtx_out) {
+  const GParams& p = c.p;
+  const int64_t y = p.y;
+  const int64_t sqrtx = p.sqrtx;
+  const size_t a_lo = upper_index(c.primes, p.xstar);    // A: pb > x*
+  const size_t a_hi = upper_index(c.primes, p.x13);      //    pb <= x^(1/3)
+  const bool haveA = a_lo < a_hi;
+  const int64_t a_pbmin = haveA ? c.primes[a_lo] : 0;
+  const int64_t Vmax_A =
+      haveA ? divx(x, static_cast<int128_t>(a_pbmin) * a_pbmin) : 0;
+  const size_t c_lo = static_cast<size_t>(p.k);          // C: pb > p_k
+  const size_t c_hi = upper_index(c.primes, p.xstar);    //    pb <= x*
+  const bool haveC = c_lo < c_hi;
+  const int64_t Vmax_C =
+      static_cast<int64_t>(static_cast<int128_t>(p.xstar) * p.xstar); // v < x*^2
+  const bool checkpmax = (p.z != p.y);
+
+  const int64_t Vmax = std::max<int64_t>({Vmax_A, haveC ? Vmax_C : 0, sqrtx});
+  if (Vmax < 2) {
+    A_out = 0;
+    C_out = 0;
+    pisqrtx_out = 0;
+    return;
+  }
+
+  int64_t Slog = 20;
+  if (const char* e = std::getenv("PC_ACSEGLOG"))
+    Slog = std::atoi(e);
+  const int64_t S = int64_t(1) << Slog;
+  const int64_t V0 = 2;
+  const int64_t nseg = (Vmax - V0) / S + 1;
+  const size_t nsieve = upper_index(c.primes, isqrt(Vmax));
+
+  std::vector<int64_t> seg_pcount(nseg, 0), seg_pi_lo(nseg, 0);
+  std::vector<int64_t> segA_part(nseg, 0), segA_wsum(nseg, 0);
+  std::vector<maxint_t> segC_part(nseg, 0), segC_csum(nseg, 0),
+      segC_cbsum(nseg, 0);
+
+  // Opt-in profiling (PC_LMPROF): fill-ratio of C's dense m-scan and a coarse
+  // sieve/A/C time split. Bounds the theoretical speedup of a sparse C rewrite.
+  const bool prof = std::getenv("PC_LMPROF") != nullptr;
+  // PC_LMPROF_NOEMIT: skip the lc_at/divx emit work (value becomes WRONG) to
+  // isolate the pure scan+decode+reject cost. Diff vs full run = emit cost.
+  const bool noemit = std::getenv("PC_LMPROF_NOEMIT") != nullptr;
+  // C is computed by the sparse c_impl_sparse by DEFAULT; the sweep then yields
+  // A + pi(sqrt x) only (C_out = 0). PC_NOCSPARSE reverts to the dense fused C
+  // (the bit-exact oracle).
+  const bool skipC = std::getenv("PC_NOCSPARSE") == nullptr;
+  int64_t pf_c_total = 0, pf_c_sf = 0, pf_c_emit = 0;
+  int64_t pf_v_le = 0, pf_v_gt = 0, pf_v_gt_pbhi = 0;
+  double pf_t_sieve = 0, pf_t_A = 0, pf_t_C = 0;
+  const int64_t pf_z = p.z;
+  const int64_t pf_pbmid = p.xstar / 2; // "large pb" = pb > x*/2
+
+#pragma omp parallel num_threads(nt) reduction(+:pf_c_total,pf_c_sf,pf_c_emit,pf_v_le,pf_v_gt,pf_v_gt_pbhi,pf_t_sieve,pf_t_A,pf_t_C)
+  {
+    const int64_t NW = (S + 63) / 64;
+    std::vector<uint64_t> bits(NW + 1);
+    std::vector<int64_t> wpref(NW + 1);
+    auto pclk = [] { return std::chrono::steady_clock::now(); };
+    auto pms = [](std::chrono::steady_clock::duration d) {
+      return std::chrono::duration<double, std::milli>(d).count();
+    };
+#pragma omp for schedule(dynamic)
+    for (int64_t seg = 0; seg < nseg; ++seg) {
+      const int64_t low = V0 + seg * S;
+      const int64_t high = std::min<int64_t>(low + S, Vmax + 1);
+      const int64_t len = high - low;
+      const int64_t nw = (len + 63) / 64;
+      auto ts0 = pclk();
+      std::fill(bits.begin(), bits.begin() + nw, ~uint64_t(0));
+      if (len & 63)
+        bits[nw - 1] &= (uint64_t(1) << (len & 63)) - 1;
+      for (size_t si = 0; si < nsieve; ++si) {
+        const int64_t pp = c.primes[si];
+        if (pp * pp >= high)
+          break;
+        int64_t k = (low + pp - 1) / pp;
+        if (k < 2)
+          k = 2;
+        for (int64_t m = pp * k; m < high; m += pp) {
+          const int64_t pos = m - low;
+          bits[pos >> 6] &= ~(uint64_t(1) << (pos & 63));
+        }
+      }
+      int64_t run = 0;
+      for (int64_t w = 0; w < nw; ++w) {
+        wpref[w] = run;
+        run += std::popcount(bits[w]);
+      }
+      seg_pcount[seg] = run;
+      if (prof) pf_t_sieve += pms(pclk() - ts0);
+
+      auto lc_at = [&](int64_t v) -> int64_t {
+        const int64_t pos = v - low;
+        const unsigned bit = static_cast<unsigned>(pos & 63);
+        const uint64_t mask =
+            (bit == 63) ? ~uint64_t(0) : ((uint64_t(1) << (bit + 1)) - 1);
+        return wpref[pos >> 6] + std::popcount(bits[pos >> 6] & mask);
+      };
+
+      // pi(sqrt x): primes in [low, min(high-1, sqrt x)] (at most one straddling seg).
+      if (low <= sqrtx)
+        seg_pi_lo[seg] = (high - 1 <= sqrtx) ? run : lc_at(sqrtx);
+
+      // --- A emitter (gourdon.md §5) ---
+      auto tA0 = pclk();
+      if (haveA && low <= Vmax_A) {
+        size_t ib_end = std::min(a_hi, upper_index(c.primes, isqrt(x / low)));
+        const int64_t pblo = divx(x, static_cast<int128_t>(high) * high);
+        size_t ib_start = std::max(a_lo, upper_index(c.primes, pblo));
+        if (ib_start > a_lo)
+          --ib_start;
+        int64_t part = 0, wsum = 0;
+        for (size_t ib = ib_start; ib < ib_end; ++ib) {
+          const int64_t pb = c.primes[ib];
+          const int128_t xp = x / pb;
+          const int64_t s = isqrt(xp);
+          const int64_t thresh = divx(xp, y);
+          int64_t q_hi = divx(x, static_cast<int128_t>(pb) * low);
+          int64_t q_lo = divx(x, static_cast<int128_t>(pb) * high) + 1;
+          if (q_lo <= pb)
+            q_lo = pb + 1;
+          if (q_hi > s)
+            q_hi = s;
+          if (q_hi < q_lo)
+            continue;
+          for (size_t qi = upper_index(c.primes, q_lo - 1);
+               qi < c.primes.size(); ++qi) {
+            const int64_t q = c.primes[qi];
+            if (q > q_hi)
+              break;
+            const int64_t lc = lc_at(divx(xp, q));
+            const int64_t w = (q <= thresh) ? 1 : 2;
+            part += w * lc;
+            wsum += w;
+          }
+        }
+        segA_part[seg] = part;
+        segA_wsum[seg] = wsum;
+      }
+      if (prof) pf_t_A += pms(pclk() - tA0);
+
+      // --- C emitter (gourdon.md §6) ---
+      auto tC0 = pclk();
+      if (haveC && !skipC && low <= Vmax_C) {
+        size_t ib_end = std::min(c_hi, upper_index(c.primes, high - 1));
+        size_t ib_start = std::max(c_lo, upper_index(c.primes, isqrt(low)));
+        if (ib_start > c_lo)
+          --ib_start;
+        maxint_t part = 0, csum = 0, cbsum = 0;
+        for (size_t ib = ib_start; ib < ib_end; ++ib) {
+          const int64_t pb = c.primes[ib];
+          const int b = static_cast<int>(ib) + 1;
+          const int128_t pb2 = static_cast<int128_t>(pb) * pb;
+          const int128_t pb3 = pb2 * pb;
+          const int64_t mlo =
+              std::max(static_cast<int64_t>(p.z / pb), divx(x, pb3));
+          const int64_t mhi = std::min<int64_t>(p.z, divx(x, pb2));
+          if (mhi <= mlo)
+            continue;
+          int64_t m_hi = std::min(mhi, divx(x, static_cast<int128_t>(pb) * low));
+          int64_t m_lo =
+              std::max(mlo + 1, divx(x, static_cast<int128_t>(pb) * high) + 1);
+          if (m_hi < m_lo)
+            continue;
+          const int64_t twob = 2 - b;
+          int64_t part_pb = 0, csum_pb = 0, cbsum_pb = 0;
+          if (prof) pf_c_total += (m_hi - m_lo + 1);
+          for (int64_t m = m_lo; m <= m_hi; ++m) {
+            const int32_t mv = c.mpv(m);
+            if (mv == 0)
+              continue;
+            if (prof) ++pf_c_sf;
+            const int64_t pmin = mv < 0 ? -mv : mv;
+            if (pmin <= pb)
+              continue;
+            if (checkpmax && c.pmax[m] > y)
+              continue;
+            if (prof) ++pf_c_emit;
+            const int64_t vv = divx(x, static_cast<int128_t>(pb) * m);
+            if (prof) {
+              if (vv <= pf_z) ++pf_v_le;
+              else { ++pf_v_gt; if (pb > pf_pbmid) ++pf_v_gt_pbhi; }
+            }
+            const int64_t lc = noemit ? 0 : lc_at(vv);
+            const int64_t coeff = (mv < 0) ? 1 : -1; // -mu(m)
+            part_pb += coeff * lc;
+            csum_pb += coeff;
+            cbsum_pb += coeff * twob;
+          }
+          part += static_cast<maxint_t>(part_pb);
+          csum += static_cast<maxint_t>(csum_pb);
+          cbsum += static_cast<maxint_t>(cbsum_pb);
+        }
+        segC_part[seg] = part;
+        segC_csum[seg] = csum;
+        segC_cbsum[seg] = cbsum;
+      }
+      if (prof) pf_t_C += pms(pclk() - tC0);
+    }
+  }
+
+  if (prof) {
+    const double tot = pf_t_sieve + pf_t_A + pf_t_C;
+    std::fprintf(stderr,
+        "[LMPROF ac_sweep] thread-ms: sieve=%.0f A=%.0f C=%.0f (sum=%.0f)\n"
+        "  C dense-scan fill: m_total=%lld squarefree=%lld(%.1f%%) emit=%lld(%.2f%%)\n"
+        "  C emit v-split: v<=z=%lld(%.1f%%) v>z=%lld(%.1f%%) [of v>z: pb>x*/2 = %lld(%.1f%%)]\n",
+        pf_t_sieve, pf_t_A, pf_t_C, tot,
+        (long long)pf_c_total, (long long)pf_c_sf,
+        pf_c_total ? 100.0 * pf_c_sf / pf_c_total : 0.0,
+        (long long)pf_c_emit,
+        pf_c_total ? 100.0 * pf_c_emit / pf_c_total : 0.0,
+        (long long)pf_v_le, pf_c_emit ? 100.0 * pf_v_le / pf_c_emit : 0.0,
+        (long long)pf_v_gt, pf_c_emit ? 100.0 * pf_v_gt / pf_c_emit : 0.0,
+        (long long)pf_v_gt_pbhi,
+        pf_v_gt ? 100.0 * pf_v_gt_pbhi / pf_v_gt : 0.0);
+  }
+
+  // Sequential folds sharing one running prime count (pi(low-1)).
+  maxint_t A = 0, C = 0;
+  int64_t running = 0, pisx = 0;
+  for (int64_t seg = 0; seg < nseg; ++seg) {
+    A += static_cast<maxint_t>(segA_part[seg]) +
+         static_cast<int128_t>(running) * segA_wsum[seg];
+    C += segC_part[seg] + static_cast<int128_t>(running) * segC_csum[seg] +
+         segC_cbsum[seg];
+    pisx += seg_pi_lo[seg];
+    running += seg_pcount[seg];
+  }
+  A_out = A;
+  C_out = C;
+  pisqrtx_out = pisx;
+}
+
+maxint_t pi_gourdon_lowmem(int128_t x, int nt) {
+  GParams p = make_gparams(x);
+  int64_t d_pi_limit = p.x13;
+  if (const char* e = std::getenv("PC_DPILIM"))
+    d_pi_limit = std::atoll(e);
+  const bool prof = std::getenv("PC_LMPROF") != nullptr;
+  using pclk = std::chrono::steady_clock;
+  auto pms = [](pclk::duration d) {
+    return std::chrono::duration<double, std::milli>(d).count();
+  };
+  if (prof)
+    std::fprintf(stderr,
+        "[LMPROF params] x13=%lld xstar=%lld z=%lld y=%lld sqrtx=%lld k=%lld\n",
+        (long long)p.x13, (long long)p.xstar, (long long)p.z, (long long)p.y,
+        (long long)p.sqrtx, (long long)p.k);
+  auto t0 = pclk::now();
+  GCtx c = build_ctx_lowmem(x, nt, d_pi_limit);
+  auto t1 = pclk::now();
+  maxint_t a, c_term;
+  int128_t pisqrtx;
+  ac_pi_sweep(x, c, nt, a, c_term, pisqrtx); // A (+C if PC_NOCSPARSE) + pi(sqrt x)
+  if (std::getenv("PC_NOCSPARSE") == nullptr) // default: sweep gave C=0, do it sparsely
+    c_term = c_impl_sparse(x, c, nt);
+  auto t2 = pclk::now();
+  const maxint_t sigma = sigma_impl(x, c, pisqrtx);
+  auto t3 = pclk::now();
+  const maxint_t b = b_impl_wheel(x, c, nt, pisqrtx);
+  auto t4 = pclk::now();
+  const maxint_t phi0 = phi0_impl(x, c);
+  auto t5 = pclk::now();
+  const maxint_t d = d_impl(x, c, nt);
+  auto t6 = pclk::now();
+  if (prof)
+    std::fprintf(stderr,
+        "[LMPROF lowmem] wall-ms: build=%.0f AC=%.0f sigma=%.0f B=%.0f "
+        "phi0=%.0f D=%.0f | total=%.0f\n",
+        pms(t1 - t0), pms(t2 - t1), pms(t3 - t2), pms(t4 - t3),
+        pms(t5 - t4), pms(t6 - t5), pms(t6 - t0));
+  return a - b + c_term + d + phi0 + sigma;
+}
+
 maxint_t g_pi(int128_t x, int t) {
   if (x < 2)
     return 0;
@@ -1922,6 +2755,13 @@ maxint_t g_pi(int128_t x, int t) {
   if (x < kSieveCutoff)
     return count_primes(static_cast<int64_t>(x));
   const int nt = resolve_threads(t);
+  // LOW-MEM build (CLI --ram / --auto, or PC_LOWMEM): no O(sqrt x) PiTable, packed
+  // 24-bit mp[]; peak RSS ~ O(x^(1/3)) (slope sqrt x -> x^(1/3)). With the SPARSE C
+  // (default here; see c_impl_sparse) it costs only ~1.2x time vs the default path
+  // at 1e18 (was ~6x with the dense m-scan). Opt-in so the default (perf) path stays
+  // the fastest; prefer this once RAM is the binding constraint.
+  if (std::getenv("PC_LOWMEM"))
+    return pi_gourdon_lowmem(x, nt);
   // Phased build is the DEFAULT: the full PiTable and mp[] never coexist, cutting
   // peak RSS ~42% (1675->984 MiB @1e20) for ~0% time. PC_NOPHASE reverts to the
   // legacy single-context build (PiTable + mp[] live together) for comparison.

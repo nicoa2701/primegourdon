@@ -90,6 +90,20 @@ double estimate_peak_rss(int128_t x) {
   return kPeakRssPerSqrtX * std::sqrt(static_cast<double>(x));
 }
 
+// Low-RAM path (--ram / PC_LOWMEM) peak model. With the O(sqrt x) PiTable gone,
+// peak RSS is dominated by the packed mp[] + small tables and tracks ~O(x^(1/3)).
+// Calibrated conservatively from measured low-mem peaks (~109 MiB @1e18,
+// ~270 MiB @1e19, ~700 MiB @1e20): coeff = peak / x^(1/3) ~ 114..150 bytes; 160
+// over-estimates at every measured point so --auto/guardrail refuse up front
+// rather than OOM-killing mid-run.
+constexpr double kPeakRssPerCbrtX = 160.0;
+
+double estimate_peak_rss_lowmem(int128_t x) {
+  if (x < 1)
+    return 0.0;
+  return kPeakRssPerCbrtX * std::cbrt(static_cast<double>(x));
+}
+
 [[noreturn]] void usage(int code) {
   std::cout
       << "Usage: primecount X [option]\n"
@@ -99,6 +113,9 @@ double estimate_peak_rss(int128_t x) {
          "  --AC              compute only the A+C term\n"
          "  --B               compute only the B term\n"
          "  --D               compute only the D term\n"
+         "  --perf            optimize for speed (default)\n"
+         "  --ram             optimize for low peak RAM (~x^1/3) over speed\n"
+         "  --auto            perf if its peak fits in free RAM, else ram\n"
          "  -v, --verbose     print every term with its own timing\n"
          "  -t, --threads N   number of threads (default: all cores)\n"
          "  --force           run even if the estimated peak RSS exceeds free RAM\n"
@@ -157,6 +174,11 @@ bool parse_number(const std::string& s, int128_t& out) {
 } // namespace
 
 int main(int argc, char** argv) {
+  // RAM/speed trade-off selector (default perf). --auto is resolved against free
+  // RAM below, once x is parsed.
+  enum class Mode { Perf, Ram, Auto };
+  Mode mode = Mode::Perf;
+
   std::string x_arg;
   std::string term;
   bool verbose = false;
@@ -174,6 +196,12 @@ int main(int argc, char** argv) {
       verbose = true;
     } else if (a == "--force") {
       force = true;
+    } else if (a == "--perf") {
+      mode = Mode::Perf;
+    } else if (a == "--ram") {
+      mode = Mode::Ram;
+    } else if (a == "--auto") {
+      mode = Mode::Auto;
     } else if (a == "--Phi0" || a == "--Sigma" || a == "--AC" || a == "--B" ||
                a == "--D") {
       if (!term.empty()) {
@@ -230,16 +258,46 @@ int main(int argc, char** argv) {
       x <= static_cast<int128_t>(100000000000LL)) // 1e11
     threads = 1;
 
-  const double est_peak = estimate_peak_rss(x);
   const uint64_t avail = mem_available_bytes(); // 0 == unknown (non-Linux)
+
+  // Resolve the RAM/speed mode. --auto runs the fast (perf) path when its estimated
+  // peak fits in free RAM, otherwise falls back to the low-RAM path instead of
+  // refusing. --ram forces low-RAM; --perf (default) forces the fast path. The
+  // low-RAM path is the PC_LOWMEM build inside g_pi; the flag just opts in via the
+  // env (PC_LOWMEM=1 still works directly). It governs the full pi(x) only — the
+  // per-term flags (--AC/--B/--D/...) always use the default build.
+  const double est_perf = estimate_peak_rss(x);
+  const double est_ram = estimate_peak_rss_lowmem(x);
+  // The low-RAM path is honored ONLY by the plain full pi(x) (g_pi -> PC_LOWMEM).
+  // Per-term flags (--AC/--B/...) and the --verbose breakdown always build the full
+  // O(sqrt x) PiTable, so they run at the PERF peak no matter the mode. The guardrail
+  // must size against what ACTUALLY runs — else it under-estimates and lets an OOM
+  // through (e.g. --ram --Phi0 at huge x estimated the low-mem peak, then the term
+  // allocated the full PiTable and got OOM-killed).
+  const bool lowmem_honored = term.empty() && !verbose;
+  bool want_lowmem = (mode == Mode::Ram);
+  if (mode == Mode::Auto)
+    want_lowmem = (avail != 0 && est_perf > static_cast<double>(avail));
+  const bool use_lowmem = want_lowmem && lowmem_honored;
+  if (use_lowmem)
+    setenv("PC_LOWMEM", "1", 1);
+  const double est_peak = use_lowmem ? est_ram : est_perf;
+  if (mode == Mode::Ram && !lowmem_honored)
+    std::cerr << "note: --ram applies only to the full pi(x) run; this invocation "
+                 "uses the default build (full PiTable).\n";
 
   if (verbose) {
     std::cout << "RAM       available " << fmt_bytes(static_cast<double>(avail))
-              << ", estimated peak ~" << fmt_bytes(est_peak);
+              << ", estimated peak ~" << fmt_bytes(est_peak) << " (mode "
+              << (use_lowmem ? "ram" : "perf")
+              << (mode == Mode::Auto ? ", auto" : "") << ")";
     if (avail != 0) {
-      // Invert the peak model kPeakRssPerSqrtX*sqrt(x) <= avail -> largest x that fits.
+      // Invert the active peak model (perf: C*sqrt x; ram: C*cbrt x) -> largest x
+      // that fits in free RAM under the selected mode.
       const double x_max =
-          std::pow(static_cast<double>(avail) / kPeakRssPerSqrtX, 2.0);
+          use_lowmem
+              ? std::pow(static_cast<double>(avail) / kPeakRssPerCbrtX, 3.0)
+              : std::pow(static_cast<double>(avail) / kPeakRssPerSqrtX, 2.0);
       char buf[32];
       std::snprintf(buf, sizeof(buf), "%.1e", x_max);
       std::cout << ", max x ~" << buf;

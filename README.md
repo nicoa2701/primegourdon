@@ -73,11 +73,28 @@ Usage: primecount X [option]
   --AC              compute only the A+C term
   --B               compute only the B term
   --D               compute only the D term
+  --perf            optimize for speed (default)
+  --ram             optimize for low peak RAM (~x^1/3) over speed
+  --auto            perf if its peak fits in free RAM, else ram
   -v, --verbose     print every term with its own timing
   -t, --threads N   number of threads (default: all cores)
   --force           run even if estimated peak RSS exceeds free RAM
   -h, --help        show this help
 ```
+
+### Memory vs speed
+
+By default the fast path is used: peak RSS grows as ~0.14·√x. For very large x
+that becomes the binding constraint, so a **low-RAM path** is available whose peak
+follows ~O(x^(1/3)) instead, at roughly 1.15–1.2× the time:
+
+- `--perf` (default) — fastest; peak RSS ~√x.
+- `--ram` — low-RAM path (no O(√x) π-table, packed Möbius/LPF table, sparse C);
+  peak RSS ~x^(1/3), bit-identical result.
+- `--auto` — run `--perf` when its estimated peak fits in free RAM, otherwise fall
+  back to `--ram` instead of refusing.
+
+These govern the full π(x) run; the per-term flags always use the default build.
 
 Example:
 

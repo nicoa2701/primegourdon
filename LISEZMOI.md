@@ -76,11 +76,29 @@ Usage : primecount X [option]
   --AC              calcule seulement le terme A+C
   --B               calcule seulement le terme B
   --D               calcule seulement le terme D
+  --perf            optimise pour la vitesse (défaut)
+  --ram             optimise le pic RAM (~x^1/3) au détriment de la vitesse
+  --auto            perf si le pic tient dans la RAM libre, sinon ram
   -v, --verbose     affiche chaque terme avec son propre chronométrage
   -t, --threads N   nombre de threads (défaut : tous les cœurs)
   --force           exécute même si le pic RSS estimé dépasse la RAM libre
   -h, --help        affiche l'aide
 ```
+
+### Mémoire contre vitesse
+
+Par défaut le chemin rapide est utilisé : le pic RSS croît en ~0,14·√x. Pour de
+très grands x cela devient la contrainte limitante ; un **chemin bas-mémoire** est
+donc disponible, dont le pic suit ~O(x^(1/3)), pour environ 1,15–1,2× le temps :
+
+- `--perf` (défaut) — le plus rapide ; pic RSS ~√x.
+- `--ram` — chemin bas-mémoire (pas de π-table en O(√x), table de Möbius/PPF
+  compactée, C éparse) ; pic RSS ~x^(1/3), résultat bit-identique.
+- `--auto` — exécute `--perf` si son pic estimé tient dans la RAM libre, sinon
+  bascule sur `--ram` au lieu de refuser.
+
+Ces modes pilotent le calcul complet de π(x) ; les flags par terme utilisent
+toujours la construction par défaut.
 
 Exemple :
 
