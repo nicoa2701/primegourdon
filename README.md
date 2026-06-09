@@ -138,14 +138,19 @@ DIV32 auto-enabled.
 | 10¹²  | 37 607 912 018        | 17 ms     | 8.4 MiB    |
 | 10¹³  | 346 065 536 839       | 47 ms     | 9.3 MiB    |
 | 10¹⁴  | 3 204 941 750 802     | 120 ms    | 10.7 MiB   |
-| 10¹⁵  | 29 844 570 422 669    | 0.52 s    | 14.2 MiB   |
-| 10¹⁶  | 279 238 341 033 925   | 2.21 s    | 23.5 MiB   |
-| 10¹⁷  | 2 623 557 157 654 233 | 10.20 s   | 49.0 MiB   |
-| 10¹⁸  | 24 739 954 287 740 860 | 46.41 s  | 115.1 MiB  |
-| 10¹⁹  | 234 057 667 276 344 607 | 220.7 s | 321.5 MiB  |
+| 10¹⁵  | 29 844 570 422 669    | 0.52 s    | 14.5 MiB   |
+| 10¹⁶  | 279 238 341 033 925   | 2.21 s    | 24.9 MiB   |
+| 10¹⁷  | 2 623 557 157 654 233 | 10.20 s   | 52.6 MiB   |
+| 10¹⁸  | 24 739 954 287 740 860 | 46.41 s  | 125.0 MiB  |
+| 10¹⁹  | 234 057 667 276 344 607 | 220.7 s | 321.7 MiB  |
 
-Time scales as **O(x^(2/3) / (log x)²)** (≈ ×4.7 per decade past 10¹⁴); peak RAM
-follows the model ≈ 0.14·√x and tracks **O(x^(1/3) (log x)³)** working set.
+(Default `--perf` path.) The **`--ram`** path trades ~1.15–1.2× time for an
+O(x^(1/3)) peak; measured peak RSS 25.8 / 48.6 / 108.8 / 270.1 MiB at
+10¹⁶ / 10¹⁷ / 10¹⁸ / 10¹⁹ — it crosses below `--perf` around 10¹⁷ and the gap
+widens with x (−16 % at 10¹⁹).
+
+Time scales as **O(x^(2/3) / (log x)²)** (≈ ×4.7 per decade past 10¹⁴); the default
+peak RAM follows ≈ 0.14·√x, the `--ram` peak ≈ O(x^(1/3)).
 
 ## Correctness
 

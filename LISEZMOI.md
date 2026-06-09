@@ -142,14 +142,19 @@ DIV32 activé automatiquement.
 | 10¹²  | 37 607 912 018        | 17 ms     | 8,4 MiB    |
 | 10¹³  | 346 065 536 839       | 47 ms     | 9,3 MiB    |
 | 10¹⁴  | 3 204 941 750 802     | 120 ms    | 10,7 MiB   |
-| 10¹⁵  | 29 844 570 422 669    | 0,52 s    | 14,2 MiB   |
-| 10¹⁶  | 279 238 341 033 925   | 2,21 s    | 23,5 MiB   |
-| 10¹⁷  | 2 623 557 157 654 233 | 10,20 s   | 49,0 MiB   |
-| 10¹⁸  | 24 739 954 287 740 860 | 46,41 s  | 115,1 MiB  |
-| 10¹⁹  | 234 057 667 276 344 607 | 220,7 s | 321,5 MiB  |
+| 10¹⁵  | 29 844 570 422 669    | 0,52 s    | 14,5 MiB   |
+| 10¹⁶  | 279 238 341 033 925   | 2,21 s    | 24,9 MiB   |
+| 10¹⁷  | 2 623 557 157 654 233 | 10,20 s   | 52,6 MiB   |
+| 10¹⁸  | 24 739 954 287 740 860 | 46,41 s  | 125,0 MiB  |
+| 10¹⁹  | 234 057 667 276 344 607 | 220,7 s | 321,7 MiB  |
+
+(Chemin `--perf` par défaut.) Le chemin **`--ram`** échange ~1,15–1,2× le temps
+contre un pic en O(x^(1/3)) ; pic RSS mesuré 25,8 / 48,6 / 108,8 / 270,1 MiB à
+10¹⁶ / 10¹⁷ / 10¹⁸ / 10¹⁹ — il passe sous `--perf` vers 10¹⁷ et l'écart se creuse
+avec x (−16 % à 10¹⁹).
 
 Le temps suit **O(x^(2/3) / (log x)²)** (≈ ×4,7 par décade au-delà de 10¹⁴) ; le
-pic RAM suit le modèle ≈ 0,14·√x et l'espace de travail **O(x^(1/3) (log x)³)**.
+pic RAM par défaut suit ≈ 0,14·√x, le pic `--ram` ≈ O(x^(1/3)).
 
 ## Correction
 
